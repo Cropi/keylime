@@ -781,6 +781,7 @@ def load_trust_anchors(path: str) -> Dict[str, Tuple[x509.Certificate, x509.Cert
     generation -> (ask, ark).
     """
     if not os.path.isdir(path):
+        logger.warning("Trust anchor store is not a directory: %s", path)
         raise ValueError(f"trust anchor store is not a directory: {path}")
     files = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith(".pem")]
 
@@ -810,9 +811,11 @@ def load_trust_anchors(path: str) -> Dict[str, Tuple[x509.Certificate, x509.Cert
         if generation in chains:
             # two files claiming the same generation must be an explicit
             # error, not a silent overwrite of the root of trust
+            logger.warning("Duplicate trust anchor for generation %s: %s", generation, pem_file)
             raise ValueError(f"duplicate trust anchor for generation {generation}: {pem_file}")
         chains[generation] = (ask, ark)
     if not chains:
+        logger.warning("No usable trust anchors found in %s", path)
         raise ValueError(f"no trust anchors found in {path}")
     return chains
 
@@ -862,6 +865,9 @@ def resolve_trust_anchors(path: Optional[str] = None) -> Dict[str, Tuple[x509.Ce
     chains = load_trust_anchors(path)
     _ANCHOR_CACHE.clear()
     _ANCHOR_CACHE.update(chains)
+    # the active root of trust must be visible in the log: which
+    # generations, from which store (bundled or configured)
+    logger.info("Loaded AMD ASK/ARK trust anchors for %s from %s", ", ".join(sorted(chains)), path)
     return dict(chains)
 
 
@@ -1005,7 +1011,7 @@ def verify_vcek_chain(
     if chain is None:
         failure.add_event(
             "vcek_chain",
-            {"message": f"the {generation} ASK/ARK chain is not available (KDS fetch failed and none is cached)"},
+            {"message": f"the {generation} ASK/ARK chain is not in the trust store"},
             False,
         )
         return False

@@ -750,7 +750,7 @@ class PhaseFailureTest(unittest.TestCase):
                 self.assertEqual(claims, {}, msg=str(failure.events))
                 self.assertIn(f"{TEE_COMPONENT}.{code}", event_ids(failure), msg=str(failure.events))
                 self.assertTrue(
-                    any("has no" in event.context for event in failure.events),
+                    any("has no usable" in event.context for event in failure.events),
                     msg=str(failure.events),
                 )
 
@@ -1295,6 +1295,25 @@ class TrustAnchorResolutionTest(unittest.TestCase):
         chains = az_snp_vtpm.resolve_trust_anchors()
         chains.pop("milan")
         self.assertIn("milan", az_snp_vtpm.resolve_trust_anchors())
+
+    def test_loader_errors_are_logged(self):
+        # a broken store must be visible in the verifier log (WARNING),
+        # not only in the failure events of individual attestations
+        with self.assertLogs("keylime.az_snp_vtpm", level=logging.WARNING):
+            with self.assertRaises(ValueError):
+                az_snp_vtpm.resolve_trust_anchors("/nonexistent-anchor-store")
+        with tempfile.TemporaryDirectory() as empty:
+            with self.assertLogs("keylime.az_snp_vtpm", level=logging.WARNING):
+                with self.assertRaises(ValueError):
+                    az_snp_vtpm.load_trust_anchors(empty)
+        with tempfile.TemporaryDirectory() as store:
+            for name in ("a.pem", "b.pem"):
+                with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as src:
+                    with open(os.path.join(store, name), "wb") as dst:
+                        dst.write(src.read())
+            with self.assertLogs("keylime.az_snp_vtpm", level=logging.WARNING):
+                with self.assertRaises(ValueError):
+                    az_snp_vtpm.load_trust_anchors(store)
 
     def test_load_duplicate_generation_raises(self):
         # two files claiming the same generation are an error, not an overwrite
