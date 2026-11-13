@@ -14,6 +14,9 @@ from unittest.mock import patch
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
+from pyasn1.codec.der import decoder as der_decoder
+from pyasn1.codec.der import encoder as der_encoder
+from pyasn1_modules import rfc2459
 
 from keylime.failure import Component, Failure
 from keylime.tee import az_snp_vtpm
@@ -767,6 +770,52 @@ class PhaseFailureTest(unittest.TestCase):
         failure = Failure(Component.TEE)
         self.assertFalse(az_snp_vtpm.verify_vmpl(dataclasses.replace(snp, vmpl=1), failure))
         self.assertIn(f"{TEE_COMPONENT}.vmpl", event_ids(failure))
+
+
+class DuplicatedExtensionTest(unittest.TestCase):
+    """A duplicated extension OID must fail closed, not raise (finding F4).
+
+    Extension parsing in cryptography is lazy, so a certificate with a
+    duplicated extension loads fine and only raises when an extension is
+    accessed -- exactly the condition _get_oid_value must contain. The
+    crafted certificate's signature is broken by the surgery, so the test
+    exercises the phase function directly (an end-to-end path would need
+    an ASK-signed certificate, i.e. AMD's key).
+    """
+
+    @staticmethod
+    def vcek_with_duplicated_extension(oid):
+        """Rebuild the v2-milan fixture VCEK with one extension duplicated."""
+        evidence = load_json("evidence-v2-milan.json")
+        der = az_snp_vtpm._b64_decode_nopad(evidence["vcek"])  # pylint: disable=protected-access
+        cert, _ = der_decoder.decode(der, asn1Spec=rfc2459.Certificate())
+        exts = cert["tbsCertificate"]["extensions"]
+        target = None
+        for ext in exts:
+            if str(ext["extnID"]) == oid:
+                target = ext
+                break
+        assert target is not None, f"extension {oid} not found in the fixture VCEK"
+        exts.append(target)
+        return x509.load_der_x509_certificate(der_encoder.encode(cert))
+
+    def setUp(self):
+        evidence = load_json("evidence-v2-milan.json")
+        parsed = az_snp_vtpm.parse_evidence(evidence)
+        hcl = az_snp_vtpm.parse_hcl_report(parsed.hcl_report)
+        self.snp = az_snp_vtpm.parse_snp_report(hcl.snp_report)
+
+    def test_duplicated_extension_fails_closed(self):
+        # a duplicated extension OID anywhere in the certificate makes the
+        # lazy extensions block raise DuplicateExtension on first access,
+        # regardless of which OID is requested: phase 7 always fails at
+        # its first lookup (the chip id) and must fail closed, not raise
+        for oid in (az_snp_vtpm.HW_ID_OID, az_snp_vtpm.UCODE_SPL_OID):
+            with self.subTest(oid=oid):
+                cert = self.vcek_with_duplicated_extension(oid)
+                failure = Failure(Component.TEE)
+                self.assertFalse(az_snp_vtpm.verify_vcek_oids(cert, self.snp, failure))
+                self.assertIn(f"{TEE_COMPONENT}.vcek_chip_id", event_ids(failure))
 
 
 class TrustAnchorsTest(unittest.TestCase):

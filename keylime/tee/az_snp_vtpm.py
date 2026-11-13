@@ -1064,11 +1064,11 @@ def _cert_within_validity(cert: x509.Certificate) -> bool:
 def _get_oid_value(cert: x509.Certificate, oid: str) -> Optional[bytes]:
     try:
         ext = cert.extensions.get_extension_for_oid(x509.ObjectIdentifier(oid)).value
-    except x509.ExtensionNotFound:
-        return None
-    except ValueError:
-        # a malformed extensions block is treated as a missing extension,
-        # so the caller fails closed
+    except (x509.ExtensionNotFound, x509.DuplicateExtension, ValueError):
+        # a missing, malformed or duplicated extension block is treated as
+        # a missing extension, so the caller fails closed (extension
+        # parsing is lazy, so a duplicated OID survives certificate loading
+        # and would raise here; DuplicateExtension is not a ValueError)
         return None
     if not isinstance(ext, x509.UnrecognizedExtension):
         return None
@@ -1098,7 +1098,7 @@ def verify_vcek_oids(vcek: x509.Certificate, snp: SnpReport, failure: Failure) -
     """Check that the VCEK AMD OID extensions match the report (chip id + TCB)."""
     hw_id = _get_oid_value(vcek, HW_ID_OID)
     if hw_id is None:
-        failure.add_event("vcek_chip_id", {"message": "VCEK certificate has no HW_ID extension"}, False)
+        failure.add_event("vcek_chip_id", {"message": "VCEK certificate has no usable HW_ID extension"}, False)
         return False
     try:
         if _decode_oid_octets(hw_id, len(snp.chip_id)) != snp.chip_id:
@@ -1129,7 +1129,9 @@ def verify_vcek_oids(vcek: x509.Certificate, snp: SnpReport, failure: Failure) -
     for oid, expected, name in tcb_values:
         raw = _get_oid_value(vcek, oid)
         if raw is None:
-            failure.add_event("vcek_oid_mismatch", {"message": f"VCEK certificate has no {name} SPL extension"}, False)
+            failure.add_event(
+                "vcek_oid_mismatch", {"message": f"VCEK certificate has no usable {name} SPL extension"}, False
+            )
             return False
         try:
             actual = _decode_oid_int(raw)
