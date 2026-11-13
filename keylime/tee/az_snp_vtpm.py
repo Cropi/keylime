@@ -317,9 +317,7 @@ def _parse_evidence_v2(evidence: Dict[str, Any]) -> Evidence:
         quote_pcrs=[bytes.fromhex(p) for p in tpm_quote["pcrs"]],
         hcl_report=_b64_decode_nopad(evidence["hcl_report"]),
         vcek=_load_x509_certificate(_b64_decode_nopad(evidence["vcek"])),
-        cc_eventlog=(
-            base64.b64decode(evidence["cc_eventlog"], validate=True) if evidence.get("cc_eventlog") else None
-        ),
+        cc_eventlog=(base64.b64decode(evidence["cc_eventlog"], validate=True) if evidence.get("cc_eventlog") else None),
     )
 
 
@@ -499,9 +497,7 @@ def parse_hcl_report(hcl_report: bytes) -> HclReport:
     """Parse the Azure HCL container: header + SNP report + runtime claims."""
     header = _parse_hcl_header(hcl_report)
 
-    snp_report = hcl_report[
-        SNP_REPORT_OFFSET : SNP_REPORT_OFFSET + SNP_REPORT_SIZE
-    ]
+    snp_report = hcl_report[SNP_REPORT_OFFSET : SNP_REPORT_OFFSET + SNP_REPORT_SIZE]
     if len(snp_report) != SNP_REPORT_SIZE:
         raise ValueError("HCL report does not contain a full SNP report payload")
 
@@ -747,9 +743,7 @@ def _classify_anchor_bundle(certs: List[x509.Certificate]) -> Tuple[x509.Certifi
     return ask, ark
 
 
-def _check_anchor_generation(
-    ask: x509.Certificate, ark: x509.Certificate, expected: Optional[str] = None
-) -> str:
+def _check_anchor_generation(ask: x509.Certificate, ark: x509.Certificate, expected: Optional[str] = None) -> str:
     """The ASK and ARK must name the same processor generation (and, when
     fetching for a specific generation, the one requested)."""
     gen_ask = _generation_from_name(ask.subject)
@@ -882,7 +876,9 @@ def _rsa_pss_verify(public_key: Any, signature: bytes, data: bytes) -> bool:
         return False
 
 
-def verify_tpm_signature(quote_message: bytes, quote_signature: bytes, ak_pub: rsa.RSAPublicKey, failure: Failure) -> bool:
+def verify_tpm_signature(
+    quote_message: bytes, quote_signature: bytes, ak_pub: rsa.RSAPublicKey, failure: Failure
+) -> bool:
     """Check the RSA-SHA256 signature over the TPM quote message with the AK from the HCL claims."""
     try:
         ak_pub.verify(quote_signature, quote_message, padding.PKCS1v15(), hashes.SHA256())
@@ -977,7 +973,10 @@ def verify_user_data(hcl: HclReport, nonce: bytes, failure: Failure, evidence_ve
 
 
 def verify_vcek_chain(
-    vcek: x509.Certificate, snp: SnpReport, chains: Dict[str, Tuple[x509.Certificate, x509.Certificate]], failure: Failure
+    vcek: x509.Certificate,
+    snp: SnpReport,
+    chains: Dict[str, Tuple[x509.Certificate, x509.Certificate]],
+    failure: Failure,
 ) -> bool:
     """Validate the ARK -> ASK -> VCEK chain and the VCEK validity period.
 
@@ -1002,9 +1001,7 @@ def verify_vcek_chain(
         # an undecodable issuer name: no warning, the pinned chain walk decides
         issuer_gen = None
     if issuer_gen is not None and issuer_gen != generation:
-        logger.warning(
-            "VCEK issuer suggests %s but the report is %s; using the report's chain", issuer_gen, generation
-        )
+        logger.warning("VCEK issuer suggests %s but the report is %s; using the report's chain", issuer_gen, generation)
 
     ask, ark = chain
     # ARK self-signed, ASK signed by the ARK, VCEK signed by the ASK

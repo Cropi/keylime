@@ -334,7 +334,9 @@ class HclReportTest(unittest.TestCase):
     def test_runtime_truncated_data(self):
         # data_size is consistent with claim_size, but larger than the bytes present
         wrong = bytearray(self.report)
-        struct.pack_into("<I", wrong, az_snp_vtpm.HCL_RUNTIME_DATA_OFFSET, az_snp_vtpm.HCL_RUNTIME_DATA_HEADER_SIZE + 10**6)
+        struct.pack_into(
+            "<I", wrong, az_snp_vtpm.HCL_RUNTIME_DATA_OFFSET, az_snp_vtpm.HCL_RUNTIME_DATA_HEADER_SIZE + 10**6
+        )
         struct.pack_into("<I", wrong, az_snp_vtpm.HCL_RUNTIME_DATA_OFFSET + 16, 10**6)
         with self.assertRaises(ValueError) as ctx:
             az_snp_vtpm.parse_hcl_report(bytes(wrong))
@@ -342,9 +344,7 @@ class HclReportTest(unittest.TestCase):
 
     def test_user_data_invalid_hex(self):
         with self.assertRaises(ValueError):
-            az_snp_vtpm.parse_hcl_report(
-                MalformedEvidenceTest.synthetic_hcl(b'{"keys": [], "user-data": "zz"}')
-            )
+            az_snp_vtpm.parse_hcl_report(MalformedEvidenceTest.synthetic_hcl(b'{"keys": [], "user-data": "zz"}'))
 
     def test_snp_report_wrong_length(self):
         with self.assertRaises(ValueError) as ctx:
@@ -458,9 +458,7 @@ class PhaseFailureTest(unittest.TestCase):
         self.assert_valid_baseline()
 
     def assert_valid_baseline(self):
-        claims, failure = az_snp_vtpm.verify_attestation(
-            json.loads(json.dumps(self.evidence)), self.nonce
-        )
+        claims, failure = az_snp_vtpm.verify_attestation(json.loads(json.dumps(self.evidence)), self.nonce)
         self.assertEqual(event_ids(failure), [], msg=str(failure.events))
         self.assertTrue(claims, msg=str(failure.events))
 
@@ -606,9 +604,7 @@ class PhaseFailureTest(unittest.TestCase):
         claims, failure = az_snp_vtpm.verify_attestation(evidence, self.nonce)
         self.assertEqual(claims, {}, msg=str(failure.events))
         self.assertIn(f"{TEE_COMPONENT}.hcl_report", event_ids(failure), msg=str(failure.events))
-        self.assertTrue(
-            any("CPUID" in event.context for event in failure.events), msg=str(failure.events)
-        )
+        self.assertTrue(any("CPUID" in event.context for event in failure.events), msg=str(failure.events))
 
     def test_vcek_missing_oid_extension(self):
         """A VCEK missing an extension must fail, not pass silently."""
@@ -626,9 +622,7 @@ class PhaseFailureTest(unittest.TestCase):
         ):
             with self.subTest(oid=oid):
                 with patch.object(az_snp_vtpm, "_get_oid_value", side_effect=drop(oid)):
-                    claims, failure = az_snp_vtpm.verify_attestation(
-                        json.loads(json.dumps(self.evidence)), self.nonce
-                    )
+                    claims, failure = az_snp_vtpm.verify_attestation(json.loads(json.dumps(self.evidence)), self.nonce)
                 self.assertEqual(claims, {}, msg=str(failure.events))
                 self.assertIn(f"{TEE_COMPONENT}.{code}", event_ids(failure), msg=str(failure.events))
                 self.assertTrue(
@@ -697,7 +691,6 @@ class ClaimsTest(unittest.TestCase):
             self.assertIsInstance(claims[key], str)
         self.assertIn(claims["policy_debug_allowed"], ("true", "false"))
 
-
     def test_short_pcr_list(self):
         # a direct caller with a PCR list too short for PCR[8] raises cleanly
         evidence = load_json("evidence-v2-milan.json")
@@ -737,10 +730,7 @@ class TurinTcbTest(unittest.TestCase):
         envelope = load_json("evidence-v0-genoa-local.json")
         report = bytearray(bytes(envelope["data"]["tee-evidence"]["evidence"]["report"]))
         snp = bytearray(
-            report[
-                az_snp_vtpm.SNP_REPORT_OFFSET : az_snp_vtpm.SNP_REPORT_OFFSET
-                + az_snp_vtpm.SNP_REPORT_SIZE
-            ]
+            report[az_snp_vtpm.SNP_REPORT_OFFSET : az_snp_vtpm.SNP_REPORT_OFFSET + az_snp_vtpm.SNP_REPORT_SIZE]
         )
         snp[0x188] = family
         snp[0x189] = model
@@ -854,7 +844,8 @@ class MalformedEvidenceTest(unittest.TestCase):
             "<8I",
             az_snp_vtpm.HCL_HEADER_MAGIC,
             2,
-            az_snp_vtpm.SNP_REPORT_OFFSET + az_snp_vtpm.SNP_REPORT_SIZE
+            az_snp_vtpm.SNP_REPORT_OFFSET
+            + az_snp_vtpm.SNP_REPORT_SIZE
             + az_snp_vtpm.HCL_RUNTIME_DATA_HEADER_SIZE
             + len(claims_bytes),
             2,
@@ -871,12 +862,7 @@ class MalformedEvidenceTest(unittest.TestCase):
             hash_type,
             len(claims_bytes),
         )
-        return (
-            header
-            + bytes(az_snp_vtpm.SNP_REPORT_SIZE)
-            + runtime
-            + claims_bytes
-        )
+        return header + bytes(az_snp_vtpm.SNP_REPORT_SIZE) + runtime + claims_bytes
 
     def test_non_dict_evidence(self):
         for bad in (None, [], ["evidence"], "evidence", 42, True):
