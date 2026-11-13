@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import struct
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -18,8 +19,11 @@ from keylime.tee import az_snp_vtpm
 
 CURDIR = os.path.dirname(os.path.abspath(__file__))
 TESTDATA = os.path.join(CURDIR, "..", "test-data", "az_snp_vtpm")
+# the per-generation ASK/ARK PEMs moved into the package as the bundled
+# trust store (test-data keeps only the evidence fixtures)
+ANCHOR_STORE = az_snp_vtpm.BUNDLED_ANCHOR_STORE
 
-TRUST_ANCHORS = az_snp_vtpm.load_trust_anchors(TESTDATA)
+TRUST_ANCHORS = az_snp_vtpm.load_trust_anchors(ANCHOR_STORE)
 
 
 def seed_anchor_cache(chains=None):
@@ -179,13 +183,14 @@ class VerifyAttestationTest(unittest.TestCase):
         self.assertEqual(event_ids(failure), [])
 
     def test_missing_trust_anchors(self):
-        # no cached chains and the KDS fetch fails -> fail closed
+        # an anchor store with no usable chain -> fail closed
         envelope = load_json("evidence-v0-genoa-local.json")
         az_snp_vtpm.clear_anchor_cache()
-        with patch.object(az_snp_vtpm, "fetch_kds_chain", side_effect=ValueError("KDS down")):
-            claims, failure = az_snp_vtpm.verify_attestation(
-                keylime_evidence(envelope), derive_keylime_evidence_nonce(envelope)
-            )
+        with tempfile.TemporaryDirectory() as empty:
+            with patch.object(az_snp_vtpm.config, "get", return_value=empty):
+                claims, failure = az_snp_vtpm.verify_attestation(
+                    keylime_evidence(envelope), derive_keylime_evidence_nonce(envelope)
+                )
         self.assertEqual(claims, {})
         self.assertIn(f"{TEE_COMPONENT}.missing_trust_anchors", event_ids(failure))
 
@@ -540,11 +545,10 @@ class PhaseFailureTest(unittest.TestCase):
 
     def test_vcek_wrong_chain(self):
         # Genoa VCEK against Milan-only anchors fails: seed only the Milan
-        # pair and make the KDS fetch fail so nothing else gets added
+        # pair so the Genoa chain is unavailable
         genoa = load_json("evidence-v0-genoa.json")
         seed_anchor_cache({"milan": TRUST_ANCHORS["milan"]})
-        with patch.object(az_snp_vtpm, "fetch_kds_chain", side_effect=ValueError("KDS down")):
-            claims, failure = az_snp_vtpm.verify_attestation(genoa, REPORT_DATA_GENOA)
+        claims, failure = az_snp_vtpm.verify_attestation(genoa, REPORT_DATA_GENOA)
         self.assertEqual(claims, {})
         self.assertIn(f"{TEE_COMPONENT}.vcek_chain", event_ids(failure))
 
@@ -650,12 +654,21 @@ class PhaseFailureTest(unittest.TestCase):
 
 class TrustAnchorsTest(unittest.TestCase):
     def test_load_all_generations(self):
-        chains = az_snp_vtpm.load_trust_anchors(TESTDATA)
+        chains = az_snp_vtpm.load_trust_anchors(ANCHOR_STORE)
         self.assertEqual(set(chains), {"milan", "genoa", "turin"})
 
-    def test_single_file(self):
-        chains = az_snp_vtpm.load_trust_anchors(os.path.join(TESTDATA, "genoa_ask_ark.pem"))
+    def test_single_generation_directory(self):
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as src:
+                with open(os.path.join(store, "genoa_ask_ark.pem"), "wb") as dst:
+                    dst.write(src.read())
+            chains = az_snp_vtpm.load_trust_anchors(store)
         self.assertEqual(set(chains), {"genoa"})
+
+    def test_single_file_rejected(self):
+        # the store must be a directory, not a single PEM file
+        with self.assertRaises(ValueError):
+            az_snp_vtpm.load_trust_anchors(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"))
 
     def test_unparseable_file_skipped(self):
         """A corrupt anchor file is skipped with a warning, not a crash."""
@@ -666,11 +679,37 @@ class TrustAnchorsTest(unittest.TestCase):
             with open(bad, "wb") as f:
                 f.write(b"this is not a certificate bundle")
             with open(os.path.join(tmp, "zzcopy.pem"), "wb") as f:
-                with open(os.path.join(TESTDATA, "genoa_ask_ark.pem"), "rb") as g:
+                with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as g:
                     f.write(g.read())
             with self.assertLogs("keylime.az_snp_vtpm", level=logging.WARNING):
                 chains = az_snp_vtpm.load_trust_anchors(tmp)
         self.assertEqual(set(chains), {"genoa"})
+
+
+class BundledAnchorTest(unittest.TestCase):
+    """The bundled trust store is pinned: any change must be a conscious edit.
+
+    The sha256 of each bundled anchor is recorded here so that refreshing a
+    chain (see keylime/tee/amd_cert_store/README.md) always shows up as a
+    test failure until the pin is updated alongside the file.
+    """
+
+    PINNED_SHA256 = {
+        "milan": "cc871f0d2294176386175d9b5b962e18556b15ec13f55f8698b5f7a07aebf0c7",
+        "genoa": "7397ae50f4bac4699393121cf7ce9e72bac49f9f7b8c524be8df97e59ca151e3",
+        "turin": "34251ef16c414387e2bf36a69b675329156361e6e8113241209e46ebbd6da93f",
+    }
+
+    def test_bundled_anchors_are_pinned(self):
+        for generation, digest in self.PINNED_SHA256.items():
+            with open(os.path.join(ANCHOR_STORE, f"{generation}_ask_ark.pem"), "rb") as f:
+                actual = hashlib.sha256(f.read()).hexdigest()
+            self.assertEqual(
+                actual,
+                digest,
+                f"the bundled {generation} ASK/ARK chain changed; if intentional, refresh it "
+                "per amd_cert_store/README.md and update this pin in the same commit",
+            )
 
 
 class ClaimsTest(unittest.TestCase):
@@ -1035,8 +1074,8 @@ class MalformedEvidenceTest(unittest.TestCase):
         self.assert_invalid_v2(broken)
 
 
-class KdsFetchTest(unittest.TestCase):
-    """KDS fetch and in-memory anchor caching (no network in tests)."""
+class TrustAnchorResolutionTest(unittest.TestCase):
+    """Local trust-store resolution and in-memory anchor caching (no network)."""
 
     def setUp(self):
         az_snp_vtpm.clear_anchor_cache()
@@ -1044,51 +1083,118 @@ class KdsFetchTest(unittest.TestCase):
     def tearDown(self):
         az_snp_vtpm.clear_anchor_cache()
 
-    @staticmethod
-    def kds_mock(calls):
-        def fake_fetch(generation):
-            calls.append(generation)
-            return TRUST_ANCHORS[generation]
-
-        return patch.object(az_snp_vtpm, "fetch_kds_chain", side_effect=fake_fetch)
-
-    def test_resolve_fetches_each_generation_once(self):
-        calls = []
-        with self.kds_mock(calls):
+    def test_resolve_uses_bundled_store_without_network(self):
+        # the default resolution must never touch the network
+        with patch.object(az_snp_vtpm.requests, "get", side_effect=AssertionError("network access")):
             chains = az_snp_vtpm.resolve_trust_anchors()
-            self.assertEqual(set(chains), {"milan", "genoa", "turin"})
-            self.assertEqual(sorted(calls), ["genoa", "milan", "turin"])
-            # second resolve: served from the in-memory cache, no fetches
-            az_snp_vtpm.resolve_trust_anchors()
-            self.assertEqual(len(calls), 3)
-        # the cache persists even after the fetch patch is gone
-        self.assertEqual(set(az_snp_vtpm.resolve_trust_anchors()), {"milan", "genoa", "turin"})
+        self.assertEqual(set(chains), {"milan", "genoa", "turin"})
+        # second resolve: served from the in-memory cache
+        with patch.object(az_snp_vtpm.requests, "get", side_effect=AssertionError("network access")):
+            self.assertEqual(set(az_snp_vtpm.resolve_trust_anchors()), {"milan", "genoa", "turin"})
 
-    def test_resolve_partial_fetch(self):
-        # a generation whose fetch fails is skipped; the others still work
-        def fake_fetch(generation):
-            if generation == "genoa":
-                return TRUST_ANCHORS["genoa"]
-            raise ValueError("KDS down")
-
-        with patch.object(az_snp_vtpm, "fetch_kds_chain", side_effect=fake_fetch):
-            chains = az_snp_vtpm.resolve_trust_anchors()
+    def test_resolve_honors_explicit_path(self):
+        # a store with a single generation: only that chain is available
+        # and the explicit path replaces the cache
+        seed_anchor_cache()  # warm cache must not shadow the explicit path
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as src:
+                with open(os.path.join(store, "genoa_ask_ark.pem"), "wb") as dst:
+                    dst.write(src.read())
+            chains = az_snp_vtpm.resolve_trust_anchors(store)
         self.assertEqual(set(chains), {"genoa"})
+        self.assertEqual(set(az_snp_vtpm.resolve_trust_anchors()), {"genoa"})
 
-    def test_resolve_total_failure(self):
-        with patch.object(az_snp_vtpm, "fetch_kds_chain", side_effect=ValueError("KDS down")):
-            with self.assertLogs("keylime.az_snp_vtpm", level=logging.WARNING):
-                with self.assertRaises(ValueError):
-                    az_snp_vtpm.resolve_trust_anchors()
+    def test_resolve_honors_config_path(self):
+        # the [verifier] amd_anchor_path option points at a custom store
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(ANCHOR_STORE, "milan_ask_ark.pem"), "rb") as src:
+                with open(os.path.join(store, "milan_ask_ark.pem"), "wb") as dst:
+                    dst.write(src.read())
+            with patch.object(az_snp_vtpm.config, "get", return_value=store):
+                chains = az_snp_vtpm.resolve_trust_anchors()
+        self.assertEqual(set(chains), {"milan"})
+
+    def test_resolve_empty_config_uses_bundled_store(self):
+        # an empty amd_anchor_path (the default) means the bundled store
+        with patch.object(az_snp_vtpm.config, "get", return_value=""):
+            self.assertEqual(set(az_snp_vtpm.resolve_trust_anchors()), {"milan", "genoa", "turin"})
+
+    def test_resolve_empty_store_fails(self):
+        with tempfile.TemporaryDirectory() as empty:
+            with self.assertRaises(ValueError):
+                az_snp_vtpm.resolve_trust_anchors(empty)
+
+    def test_resolve_returns_snapshot(self):
+        # mutating the returned mapping must not affect the process-global cache
+        chains = az_snp_vtpm.resolve_trust_anchors()
+        chains.pop("milan")
+        self.assertIn("milan", az_snp_vtpm.resolve_trust_anchors())
+
+    def test_load_duplicate_generation_raises(self):
+        # two files claiming the same generation are an error, not an overwrite
+        with tempfile.TemporaryDirectory() as store:
+            for name in ("a.pem", "b.pem"):
+                with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as src:
+                    with open(os.path.join(store, name), "wb") as dst:
+                        dst.write(src.read())
+            with self.assertRaises(ValueError):
+                az_snp_vtpm.load_trust_anchors(store)
+
+    def test_load_ambiguous_ark_raises(self):
+        # two self-signed certificates in one bundle are an ambiguous ARK
+        with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as f:
+            genoa = x509.load_pem_x509_certificates(f.read())
+        with open(os.path.join(ANCHOR_STORE, "turin_ask_ark.pem"), "rb") as f:
+            turin = x509.load_pem_x509_certificates(f.read())
+        both_arks = b"".join(cert.public_bytes(serialization.Encoding.PEM) for cert in (genoa[0], genoa[1], turin[1]))
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(store, "mixed.pem"), "wb") as f:
+                f.write(both_arks)
+            with self.assertRaises(ValueError):
+                az_snp_vtpm.load_trust_anchors(store)
+
+
+class VerifyAnchorsParameterTest(unittest.TestCase):
+    """The anchors= parameter of verify_attestation (no network)."""
+
+    def setUp(self):
+        az_snp_vtpm.clear_anchor_cache()
+
+    def tearDown(self):
+        az_snp_vtpm.clear_anchor_cache()
+
+    def test_anchors_parameter_supplies_the_trust_store(self):
+        # cold cache + caller-supplied anchors: no store resolution at all
+        evidence = load_json("evidence-v2-milan.json")
+        with patch.object(az_snp_vtpm, "resolve_trust_anchors", side_effect=AssertionError("must not resolve")):
+            _claims, failure = az_snp_vtpm.verify_attestation(
+                evidence, REPORT_DATA_V2, anchors={"milan": TRUST_ANCHORS["milan"]}
+            )
+        self.assertEqual(event_ids(failure), [], msg=str(failure.events))
+
+    def test_anchors_parameter_missing_generation_fails_closed(self):
+        evidence = load_json("evidence-v2-milan.json")
+        with patch.object(az_snp_vtpm, "resolve_trust_anchors", side_effect=AssertionError("must not resolve")):
+            claims, failure = az_snp_vtpm.verify_attestation(
+                evidence, REPORT_DATA_V2, anchors={"genoa": TRUST_ANCHORS["genoa"]}
+            )
+        self.assertEqual(claims, {})
+        self.assertIn(f"{TEE_COMPONENT}.vcek_chain", event_ids(failure))
+
+
+class KdsFetchTest(unittest.TestCase):
+    """fetch_kds_chain() as a provisioning utility (no network in tests)."""
 
     def test_fetch_kds_chain(self):
-        with open(os.path.join(TESTDATA, "genoa_ask_ark.pem"), "rb") as f:
+        with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as f:
             body = f.read()
         response = unittest.mock.Mock(status_code=200, content=body)
         with patch.object(az_snp_vtpm.requests, "get", return_value=response) as mock_get:
             ask, ark = az_snp_vtpm.fetch_kds_chain("genoa")
         mock_get.assert_called_once_with(
-            "https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain", timeout=az_snp_vtpm.KDS_FETCH_TIMEOUT
+            "https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain",
+            timeout=az_snp_vtpm.KDS_FETCH_TIMEOUT,
+            allow_redirects=False,
         )
         self.assertEqual(az_snp_vtpm._cert_common_name(ask), "SEV-Genoa")  # pylint: disable=protected-access
         self.assertEqual(az_snp_vtpm._cert_common_name(ark), "ARK-Genoa")  # pylint: disable=protected-access
@@ -1107,9 +1213,9 @@ class KdsFetchTest(unittest.TestCase):
 
     def test_fetch_kds_chain_invalid_pair(self):
         # ASK and ARK from different generations do not sign each other
-        with open(os.path.join(TESTDATA, "genoa_ask_ark.pem"), "rb") as f:
+        with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as f:
             genoa = x509.load_pem_x509_certificates(f.read())
-        with open(os.path.join(TESTDATA, "turin_ask_ark.pem"), "rb") as f:
+        with open(os.path.join(ANCHOR_STORE, "turin_ask_ark.pem"), "rb") as f:
             turin = x509.load_pem_x509_certificates(f.read())
         mixed = b"".join(cert.public_bytes(serialization.Encoding.PEM) for cert in (genoa[0], turin[1]))
         response = unittest.mock.Mock(status_code=200, content=mixed)
@@ -1119,7 +1225,7 @@ class KdsFetchTest(unittest.TestCase):
 
     def test_fetch_kds_chain_bad_version_integer(self):
         """A bundle with an unsupported certificate version fails as ValueError, not InvalidVersion."""
-        with open(os.path.join(TESTDATA, "genoa_ask_ark.pem"), "rb") as f:
+        with open(os.path.join(ANCHOR_STORE, "genoa_ask_ark.pem"), "rb") as f:
             genoa = x509.load_pem_x509_certificates(f.read())
         der = bytearray(genoa[0].public_bytes(serialization.Encoding.DER))
         i = der.find(b"\xa0\x03\x02\x01")
@@ -1130,14 +1236,6 @@ class KdsFetchTest(unittest.TestCase):
         with patch.object(az_snp_vtpm.requests, "get", return_value=response):
             with self.assertRaises(ValueError):
                 az_snp_vtpm.fetch_kds_chain("genoa")
-
-    def test_resolve_returns_snapshot(self):
-        # mutating the returned mapping must not affect the process-global cache
-        calls = []
-        with self.kds_mock(calls):
-            chains = az_snp_vtpm.resolve_trust_anchors()
-        chains.pop("milan")
-        self.assertIn("milan", az_snp_vtpm.resolve_trust_anchors())
 
 
 if __name__ == "__main__":

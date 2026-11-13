@@ -9,9 +9,17 @@ claims holding the vTPM attestation key) and the VCEK certificate.
 This is a Python port of the reference verifier in trustee
 (deps/verifier/src/az_snp_vtpm/mod.rs).
 
-The AMD ASK/ARK anchor chains are resolved automatically: from an
-in-memory cache, or fetched from the AMD KDS
-(https://kdsintf.amd.com) on first use (see resolve_trust_anchors()).
+The AMD ASK/ARK anchor chains are resolved from a local trust store:
+the per-generation PEMs bundled with the package
+(keylime/tee/amd_cert_store, see its README for provenance), or the
+store configured with the [verifier] amd_anchor_path option. The
+default path never touches the network; fetch_kds_chain() exists to
+provision or refresh a store (see the README). A generation missing
+from the store is simply unavailable and its evidence fails closed.
+TODO: add a CI canary that fetches the current chains from the AMD
+KDS and diffs them against the bundled ones, alerting on rotation or
+staleness; alert-only (it must never update the store, as the KDS
+cannot authenticate itself) and network-opt-in for offline CI runs.
 
 TODO: reuse keylime's existing TPMS_ATTEST implementation
 (keylime/tpm/tpm2_objects.py unmarshal_tpms_attest) instead of the
@@ -22,23 +30,14 @@ but for now the self-contained parser is okay -- refactor later.
 TODO: cc_eventlog (AAEL, TCG2 format) carried in v2+ evidence is not
 parsed or replayed against the quoted PCRs (DRTM PCRs 17-22 seed from
 0xFF*32, others from zero); see trustee az_snp_vtpm verify_eventlog().
-TODO: persist the fetched ASK/ARK chains in an on-disk cache (e.g.
-/var/lib/keylime/amd_kds_cache) with a local provisioned cert store
-(e.g. /var/lib/keylime/tpm_cert_store/amd) for offline/air-gapped
-deployments; currently they are only cached in memory and re-fetched
-once per process.
-TODO: ideally, the ARK/ASK chains should be pre-fetched and shipped
-with the package (bundled in the repository / RPM) so that verification
-never depends on a live KDS fetch for its trust anchors; there should
-also be a mechanism to update these certificates in place or refresh
-the cache, in case AMD rotates the root certificates.
-TODO: generalize the KDS fetch/cache into a repo-wide certificate
+TODO: generalize the KDS fetch into a repo-wide certificate
 cache-and-fetch mechanism shared by the TEE verifiers (snp.py's
 per-attestation VCEK fetch could reuse it); this implementation is
 intentionally self-contained.
 
 Note: the in-memory anchor cache is not thread-safe; concurrent
-cold-start verifications may race and each perform their own KDS fetch.
+cold-start verifications may race and each load the store once (a
+local file read, so this is benign).
 """
 
 import base64
@@ -59,7 +58,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.x509.oid import NameOID
 
-from keylime import keylime_logging
+from keylime import config, keylime_logging
 from keylime.failure import Component, Failure
 
 logger = keylime_logging.init_logging("az_snp_vtpm")
@@ -155,9 +154,15 @@ PROCESSOR_GENERATIONS = ("milan", "genoa", "turin")
 
 # AMD Key Distribution Service: per-generation ASK/ARK certificate chains
 # (verified live: HTTP 200, application/octet-stream, PEM with ASK first,
-# ARK second)
+# ARK second). Only used by fetch_kds_chain() to provision or refresh a
+# local trust store; the verification path never fetches from here.
 KDS_CERT_CHAIN_URL = "https://kdsintf.amd.com/vcek/v1/{generation}/cert_chain"
 KDS_FETCH_TIMEOUT = 10  # seconds
+
+# Per-generation ASK/ARK chains shipped with the package; the default
+# trust store (see amd_cert_store/README.md for provenance and refresh
+# instructions)
+BUNDLED_ANCHOR_STORE = os.path.join(os.path.dirname(__file__), "amd_cert_store")
 
 # In-memory anchor cache, populated by resolve_trust_anchors(); lives for
 # the process lifetime (the chains are stable vendor certificates)
@@ -730,6 +735,8 @@ def _classify_anchor_bundle(certs: List[x509.Certificate]) -> Tuple[x509.Certifi
     ask = ark = None
     for cert in certs:
         if cert.subject == cert.issuer:  # the self-signed root
+            if ark is not None:
+                raise ValueError("multiple self-signed certificates in the bundle (ambiguous ARK)")
             ark = cert
         else:
             cn = _cert_common_name(cert).lower()
@@ -766,17 +773,16 @@ def _validate_anchor_pair(ask: x509.Certificate, ark: x509.Certificate) -> bool:
 
 
 def load_trust_anchors(path: str) -> Dict[str, Tuple[x509.Certificate, x509.Certificate]]:
-    """Load per-generation ASK/ARK anchor pairs.
+    """Load per-generation ASK/ARK anchor pairs from a trust store directory.
 
-    ``path`` may be a single PEM file or a directory of PEM files. Each PEM
-    may be an AMD KDS-style bundle (ASK, ARK, VLEK in any order); the ARK
-    is identified as the self-signed certificate, the VLEK is ignored.
-    Returns a mapping generation -> (ask, ark).
+    ``path`` must be a directory of PEM files. Each PEM may be an AMD
+    KDS-style bundle (ASK, ARK, VLEK in any order); the ARK is identified
+    as the self-signed certificate, the VLEK is ignored. Returns a mapping
+    generation -> (ask, ark).
     """
-    if os.path.isdir(path):
-        files = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith(".pem")]
-    else:
-        files = [path]
+    if not os.path.isdir(path):
+        raise ValueError(f"trust anchor store is not a directory: {path}")
+    files = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith(".pem")]
 
     chains: Dict[str, Tuple[x509.Certificate, x509.Certificate]] = {}
     for pem_file in files:
@@ -801,6 +807,10 @@ def load_trust_anchors(path: str) -> Dict[str, Tuple[x509.Certificate, x509.Cert
         except ValueError as e:
             logger.warning("Skipping %s: %s", pem_file, e)
             continue
+        if generation in chains:
+            # two files claiming the same generation must be an explicit
+            # error, not a silent overwrite of the root of trust
+            raise ValueError(f"duplicate trust anchor for generation {generation}: {pem_file}")
         chains[generation] = (ask, ark)
     if not chains:
         raise ValueError(f"no trust anchors found in {path}")
@@ -810,11 +820,15 @@ def load_trust_anchors(path: str) -> Dict[str, Tuple[x509.Certificate, x509.Cert
 def fetch_kds_chain(generation: str, timeout: float = KDS_FETCH_TIMEOUT) -> Tuple[x509.Certificate, x509.Certificate]:
     """Fetch and validate the ASK/ARK chain for a generation from the AMD KDS.
 
+    Provisioning utility only: used to fill or refresh a local trust store
+    (see amd_cert_store/README.md); the verification path never calls this.
     The fetched bundle is validated before it is returned: the ARK must be
-    self-signed and the ASK signed by the ARK (RSA-PSS SHA-384).
+    self-signed and the ASK signed by the ARK (RSA-PSS SHA-384). This is
+    internal consistency, not authenticity -- fetch from a trusted network
+    and review the recorded sha256 of the result.
     """
     url = KDS_CERT_CHAIN_URL.format(generation=generation.capitalize())
-    response = requests.get(url, timeout=timeout)
+    response = requests.get(url, timeout=timeout, allow_redirects=False)
     if response.status_code != 200:
         raise ValueError(f"KDS returned status {response.status_code} for {url}")
     try:
@@ -828,26 +842,27 @@ def fetch_kds_chain(generation: str, timeout: float = KDS_FETCH_TIMEOUT) -> Tupl
     return ask, ark
 
 
-def resolve_trust_anchors() -> Dict[str, Tuple[x509.Certificate, x509.Certificate]]:
-    """Return the per-generation ASK/ARK chains, fetching from the AMD KDS.
+def resolve_trust_anchors(path: Optional[str] = None) -> Dict[str, Tuple[x509.Certificate, x509.Certificate]]:
+    """Return the per-generation ASK/ARK chains from the local trust store.
 
-    Chains are cached in memory for the lifetime of the process, so the KDS
-    is contacted at most once per generation per process. A generation whose
-    fetch fails is skipped with a warning (previously cached chains remain
-    usable); an error is raised only when no chain is available at all.
+    Resolution order: an explicit store ``path`` (a directory), then the
+    ``[verifier] amd_anchor_path`` configuration option (empty or unset
+    means the default), then the certificates bundled with the package.
+    Nothing is fetched from the network; use fetch_kds_chain() to
+    provision or refresh a store. A generation missing from the store is
+    simply unavailable and evidence of that generation fails closed.
+    Chains are cached in memory for the process lifetime (an explicit
+    ``path`` re-resolves and replaces the cache).
     """
-    for generation in PROCESSOR_GENERATIONS:
-        if generation in _ANCHOR_CACHE:
-            continue
-        try:
-            _ANCHOR_CACHE[generation] = fetch_kds_chain(generation)
-            logger.debug("Fetched the %s ASK/ARK chain from the AMD KDS", generation)
-        except (OSError, ValueError, requests.RequestException) as e:
-            logger.warning("Could not fetch the %s ASK/ARK chain from the AMD KDS: %s", generation, e)
-    if not _ANCHOR_CACHE:
-        raise ValueError("no AMD ASK/ARK chains available (the KDS fetch failed and none are cached)")
-    # return a snapshot so callers cannot mutate the process-global cache
-    return dict(_ANCHOR_CACHE)
+    if path is None:
+        if _ANCHOR_CACHE:
+            # return a snapshot so callers cannot mutate the process-global cache
+            return dict(_ANCHOR_CACHE)
+        path = config.get("verifier", "amd_anchor_path", fallback=BUNDLED_ANCHOR_STORE) or BUNDLED_ANCHOR_STORE
+    chains = load_trust_anchors(path)
+    _ANCHOR_CACHE.clear()
+    _ANCHOR_CACHE.update(chains)
+    return dict(chains)
 
 
 def clear_anchor_cache() -> None:
@@ -1306,6 +1321,7 @@ def verify_attestation(
     evidence: Dict[str, Any],
     nonce: bytes,
     init_data_hash: Optional[bytes] = None,
+    anchors: Optional[Dict[str, Tuple[x509.Certificate, x509.Certificate]]] = None,
 ) -> Tuple[Dict[str, Any], Failure]:
     """Verify az-snp-vtpm attestation evidence.
 
@@ -1316,10 +1332,12 @@ def verify_attestation(
     NOT the raw KBS challenge
     :param init_data_hash: optional expected init-data digest (checked
     against PCR[8])
-
-    The AMD ASK/ARK anchor chains are resolved automatically: from the
-    in-memory cache, or fetched from the AMD KDS on first use (see
-    resolve_trust_anchors()).
+    :param anchors: optional caller-supplied trust anchors, mapping
+    generation -> (ask, ark); when given they replace the local trust
+    store entirely (the caller brings its own root of trust, e.g. a
+    future policy layer). When absent, anchors are resolved from the
+    store: the [verifier] amd_anchor_path option, or the per-generation
+    certificates bundled with the package. No network access happens.
 
     :returns: (claims, failure) -- claims is empty when verification fails
     """
@@ -1365,13 +1383,15 @@ def verify_attestation(
     if not verify_user_data(hcl, nonce, failure, parsed.version):
         return ({}, failure)
 
-    # Phase 6 - VCEK vendor chain (anchors are resolved lazily here: from
-    # the in-memory cache, or fetched from the AMD KDS on first use):
-    # ARK self-signed -> ASK signed by ARK -> VCEK signed by ASK, pinned to
-    # the report's generation, within its validity window. Proves the VCEK
-    # is a genuine AMD certificate for this CPU generation.
+    # Phase 6 - VCEK vendor chain (anchors come from the caller via the
+    # anchors parameter, or from the local trust store -- the [verifier]
+    # amd_anchor_path option or the bundled per-generation certificates;
+    # never from the network): ARK self-signed -> ASK signed by ARK ->
+    # VCEK signed by ASK, pinned to the report's generation, within its
+    # validity window. Proves the VCEK is a genuine AMD certificate for
+    # this CPU generation.
     try:
-        chains = resolve_trust_anchors()
+        chains = anchors if anchors is not None else resolve_trust_anchors()
     except ValueError as e:
         failure.add_event("missing_trust_anchors", {"message": str(e)}, False)
         return ({}, failure)
