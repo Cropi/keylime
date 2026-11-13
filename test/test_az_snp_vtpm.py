@@ -9,6 +9,7 @@ import os
 import struct
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from cryptography import x509
@@ -174,6 +175,99 @@ class VerifyAttestationTest(unittest.TestCase):
         failure = Failure(Component.TEE)
         self.assertFalse(az_snp_vtpm.verify_init_data(INIT_DATA_HASH, [INIT_DATA_PCR8] * 8, failure))
         self.assertIn(f"{TEE_COMPONENT}.init_data", event_ids(failure))
+
+    def test_init_data_mismatch_end_to_end(self):
+        # through the main entry point: a wrong expected init-data digest
+        # must fail the whole verification (no fixture has a bound PCR[8],
+        # so the positive case stays with the direct test above)
+        envelope = load_json("evidence-v0-genoa-local.json")
+        claims, failure = self.verify(
+            keylime_evidence(envelope), derive_keylime_evidence_nonce(envelope), init_data_hash=bytes(32)
+        )
+        self.assertEqual(claims, {})
+        self.assertIn(f"{TEE_COMPONENT}.init_data", event_ids(failure))
+
+    def test_nonce_last_byte_mismatch(self):
+        # flip only the last byte of the expected nonce: a comparison
+        # weakened to a prefix would let this pass
+        evidence = load_json("evidence-v2-milan.json")
+        tampered = REPORT_DATA_V2[:-1] + bytes([REPORT_DATA_V2[-1] ^ 1])
+        claims, failure = self.verify(evidence, tampered)
+        self.assertEqual(claims, {})
+        self.assertIn(f"{TEE_COMPONENT}.quote_nonce", event_ids(failure))
+
+    def test_vcek_validity_frozen_clock(self):
+        # the real _cert_within_validity against the fixture VCEK's window,
+        # with the module clock frozen just outside it on both sides (the
+        # dates are derived from the certificate, so the test follows a
+        # refreshed fixture)
+        evidence = load_json("evidence-v2-milan.json")
+        vcek = az_snp_vtpm.parse_evidence(evidence).vcek
+        for frozen in (vcek.not_valid_after_utc + timedelta(days=1), vcek.not_valid_before_utc - timedelta(days=1)):
+            with self.subTest(frozen=frozen.isoformat()):
+
+                class FrozenDatetime(datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return cls(frozen.year, frozen.month, frozen.day, tzinfo=tz)
+
+                with patch.object(az_snp_vtpm, "datetime", FrozenDatetime):
+                    claims, failure = self.verify(evidence, REPORT_DATA_V2)
+                self.assertEqual(claims, {})
+                self.assertIn(f"{TEE_COMPONENT}.vcek_validity", event_ids(failure))
+
+    def test_claims_contract_v2_milan(self):
+        # pin the complete claims map: it is the policy layer's input and
+        # every key and value is part of the output contract
+        evidence = load_json("evidence-v2-milan.json")
+        claims, failure = self.verify(evidence, REPORT_DATA_V2)
+        self.assertEqual(event_ids(failure), [], msg=str(failure.events))
+        self.assertEqual(
+            claims,
+            {
+                "policy_abi_major": "0",
+                "policy_abi_minor": "31",
+                "policy_smt_allowed": "true",
+                "policy_migrate_ma": "false",
+                "policy_debug_allowed": "false",
+                "policy_single_socket": "false",
+                "reported_tcb_bootloader": "4",
+                "reported_tcb_tee": "0",
+                "reported_tcb_snp": "24",
+                "reported_tcb_microcode": "219",
+                "platform_tsme_enabled": "false",
+                "platform_smt_enabled": "true",
+                "measurement": "WwzmStHB9jddvaX3YLmFJsobz5G4GVCRr8KOewJCUdaP4y4FrzQEjWYHZ4zSMoP/",
+                "report_data": REPORT_DATA_V2.hex(),
+                "init_data": "00" * 32,
+                "tpm": {
+                    "pcr00": "84275b2f4312cd4fc6cbe6b152ad3c3683e513d9f1e23c34fca160c8cca7a6a7",
+                    "pcr01": "d858797eb6a5e71c4524945cd454e4e01cda4a7cb530b69d4e349fcd6de70691",
+                    "pcr02": "3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969",
+                    "pcr03": "3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969",
+                    "pcr04": "7461d6b7d5922dbd8fd58bfaac8f53c3380f01708bd1593ef367e3371791e717",
+                    "pcr05": "fac76dae26e12de39777bdfdbd8e137595e6f52a6ccecb4aa2b22134fb654e3d",
+                    "pcr06": "964e9870f9bf29d7e9df42e9e4c70f59b27f489e086ba2ee6e8d62a2b0bb6131",
+                    "pcr07": "f014e5cbfa297ee787a976abc51bc1d67e23e1b9e4a60128a1106dd0adef0c5b",
+                    "pcr08": "00" * 32,
+                    "pcr09": "630dc838b500d34ba7439095443b2d06d915f5acabf4f6d9ea7f49c78a8af3f9",
+                    "pcr10": "b58de4bda56e86736246ec69bb7423516c98b4ef0dcb16d56b334ed3c7fbf523",
+                    "pcr11": "00" * 32,
+                    "pcr12": "f1a142c53586e7e2223ec74e5f4d1a4942956b1fd9ac78fafcdf85117aa345da",
+                    "pcr13": "00" * 32,
+                    "pcr14": "306f9d8b94f17d93dc6e7cf8f5c79d652eb4c6c4d13de2dddc24af416e13ecaf",
+                    "pcr15": "00" * 32,
+                    "pcr16": "00" * 32,
+                    "pcr17": "ff" * 32,
+                    "pcr18": "ff" * 32,
+                    "pcr19": "ff" * 32,
+                    "pcr20": "ff" * 32,
+                    "pcr21": "ff" * 32,
+                    "pcr22": "ff" * 32,
+                    "pcr23": "00" * 32,
+                },
+            },
+        )
 
     def test_cc_eventlog_ignored(self):
         """v2 evidence carrying a cc_eventlog must not fail (replay not implemented)."""
@@ -591,6 +685,29 @@ class PhaseFailureTest(unittest.TestCase):
         report[0x01C0] ^= 1
         with patch.dict(self.evidence, {"report": list(report)}):
             self.fail_with("vcek_chip_id")
+
+    def test_vcek_chip_id_deep_byte_mismatch(self):
+        # flip a byte in the middle of the 64-byte chip_id: a comparison
+        # weakened to a prefix would let this pass
+        report = bytearray(self.evidence["report"])
+        report[0x01C0 + 32] ^= 1
+        with patch.dict(self.evidence, {"report": list(report)}):
+            self.fail_with("vcek_chip_id")
+
+    def test_key_info_vlek_rejected(self):
+        # signing-key type VLEK (key_info bits 2-4) is rejected at parse
+        # time, before any signature check runs
+        report = bytearray(self.evidence["report"])
+        struct.pack_into("<I", report, az_snp_vtpm.SNP_REPORT_OFFSET + az_snp_vtpm.SNP_REPORT_KEY_INFO_OFFSET, 1 << 2)
+        with patch.dict(self.evidence, {"report": list(report)}):
+            self.fail_with("hcl_report")
+
+    def test_key_info_masked_report_rejected(self):
+        # MASK_CHIP_KEY (key_info bit 1): an unsigned report is rejected
+        report = bytearray(self.evidence["report"])
+        struct.pack_into("<I", report, az_snp_vtpm.SNP_REPORT_OFFSET + az_snp_vtpm.SNP_REPORT_KEY_INFO_OFFSET, 0b10)
+        with patch.dict(self.evidence, {"report": list(report)}):
+            self.fail_with("hcl_report")
 
     def test_report_missing_cpuid(self):
         """A report without CPUID (version 2) fails closed with an honest error.
